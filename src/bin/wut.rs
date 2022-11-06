@@ -10,11 +10,23 @@ enum Token {
     Star,
     Slash,
     Semicolon,
-    Equals,
+    Assign,
     IntLiteral(i32),
     EndOfStream,
     Int,
     Identifier(String),
+    Equals,
+    NotEquals,
+    LessThan,
+    GreaterThan,
+    LessEqual,
+    GreaterEqual,
+    LeftBrace,
+    RightBrace,
+    LeftParen,
+    RightParen,
+    If,
+    Else,
 }
 
 #[derive(Debug,PartialEq)]
@@ -24,11 +36,19 @@ enum AstOp {
     Multiply,
     Divide,
     Assign,
+    Equals,
+    NotEquals,
+    LessThan,
+    GreaterThan,
+    LessEqual,
+    GreaterEqual,
 }
 
 #[derive(Debug,PartialEq)]
 enum AstNode {
+    Glue(Box<AstNode>, Box<AstNode>),
     BinaryOp(AstOp, Box<AstNode>, Box<AstNode>),
+    If(Box<AstNode>, Box<AstNode>, Option<Box<AstNode>>),
     IntegerLiteral(i32),
     LValueIdentifier(String),
     DeclareVariable(String),
@@ -36,10 +56,10 @@ enum AstNode {
 
 fn get_token_operator_precedence(t: &Token) -> Result<i32, WutError> {
     match t {
-        Token::Plus => { Ok(10) },
-        Token::Minus => { Ok(10) },
-        Token::Star => { Ok(20) },
-        Token::Slash => { Ok(20) },
+        Token::Plus | Token::Minus => { Ok(10) },
+        Token::Star | Token::Slash => { Ok(20) },
+        Token::Equals | Token::NotEquals => { Ok(30) },
+        Token::LessThan | Token::GreaterThan | Token::LessEqual | Token::GreaterEqual => { Ok(40) },
         _ => { Err(WutError::UnexpectedToken(t.clone())) },
     }
 }
@@ -92,6 +112,12 @@ fn get_token_from_ident(ident: &str) -> Result<Token, WutError> {
     if ident == "int" {
         return Ok(Token::Int)
     }
+    if ident == "if" {
+        return Ok(Token::If)
+    }
+    if ident == "else" {
+        return Ok(Token::Else)
+    }
     Ok(Token::Identifier(ident.to_string()))
 }
 
@@ -104,7 +130,46 @@ fn scan(is: &mut dyn CharStream) -> Result<Token, WutError> {
                 '*' => { Ok(Token::Star) },
                 '/' => { Ok(Token::Slash) },
                 ';' => { Ok(Token::Semicolon) },
-                '=' => { Ok(Token::Equals) },
+                '{' => { Ok(Token::LeftBrace) },
+                '}' => { Ok(Token::RightBrace) },
+                '(' => { Ok(Token::LeftParen) },
+                ')' => { Ok(Token::RightParen) },
+                '=' => {
+                    if let Some(ch) = is.next() {
+                        if ch == '=' {
+                            return Ok(Token::Equals)
+                        }
+                        is.put_front(ch);
+                    }
+                    Ok(Token::Assign)
+                },
+                '!' => {
+                    if let Some(ch) = is.next() {
+                        if ch == '=' {
+                            return Ok(Token::NotEquals)
+                        }
+                        return Err(WutError::UnexpectedChar(ch))
+                    }
+                    Err(WutError::UnexpectedEndOfStream)
+                },
+                '<' => {
+                    if let Some(ch) = is.next() {
+                        if ch == '=' {
+                            return Ok(Token::LessEqual)
+                        }
+                        is.put_front(ch);
+                    }
+                    Ok(Token::LessThan)
+                },
+                '>' => {
+                    if let Some(ch) = is.next() {
+                        if ch == '=' {
+                            return Ok(Token::GreaterEqual)
+                        }
+                        is.put_front(ch);
+                    }
+                    Ok(Token::GreaterThan)
+                },
                 _ => {
                     if is_digit(ch) {
                         is.put_front(ch);
@@ -145,6 +210,18 @@ fn match_semicolon(is: &mut dyn CharStream, t: &Token) -> Result<Token, WutError
     match_token_and_scan(is, t, "expected ';'", |t| *t == Token::Semicolon)
 }
 
+fn match_leftbrace(is: &mut dyn CharStream, t: &Token) -> Result<Token, WutError> {
+    match_token_and_scan(is, t, "expected '{'", |t| *t == Token::LeftBrace)
+}
+
+fn match_leftparen(is: &mut dyn CharStream, t: &Token) -> Result<Token, WutError> {
+    match_token_and_scan(is, t, "expected '('", |t| *t == Token::LeftParen)
+}
+
+fn match_rightparen(is: &mut dyn CharStream, t: &Token) -> Result<Token, WutError> {
+    match_token_and_scan(is, t, "expected ')'", |t| *t == Token::RightParen)
+}
+
 fn var_declaration(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
     let ident = match_token_and_scan(is, t, "expected 'Int'", |t| *t == Token::Int)?;
     let (ident, t) = match_ident(is, &ident)?;
@@ -157,7 +234,7 @@ fn var_declaration(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token
 fn assignment(is: &mut dyn CharStream, ident: &Token) -> Result<(AstNode, Token), WutError> {
     let (ident, t) = match_ident(is, ident)?;
 
-    let t = match_token_and_scan(is, &t, "expected '='", |t| *t == Token::Equals)?;
+    let t = match_token_and_scan(is, &t, "expected '='", |t| *t == Token::Assign)?;
     let (left, t) = binexpr(is, &t, 0, 0)?;
     let t = match_semicolon(is, &t)?;
 
@@ -167,29 +244,82 @@ fn assignment(is: &mut dyn CharStream, ident: &Token) -> Result<(AstNode, Token)
     Ok((node, t))
 }
 
-fn statements(is: &mut dyn CharStream) -> Result<Vec<AstNode>, WutError> {
-    let mut result: Vec<AstNode> = Vec::new();
-    let mut t = scan(is)?;
+fn compound_statements(is: &mut dyn CharStream, t: &Token) -> Result<AstNode, WutError> {
+    let mut result: Option<AstNode> = None;
+    let mut t = match_leftbrace(is, &t)?;
+
     loop {
+        let next_node: Option<AstNode>;
         match t {
             Token::Int => {
                 let (node, next_token) = var_declaration(is, &t)?;
-                result.push(node);
+                next_node = Some(node);
                 t = next_token;
             },
             Token::Identifier(_) => {
                 let (node, next_token) = assignment(is, &t)?;
-                result.push(node);
+                next_node = Some(node);
+                t = next_token;
+            },
+            Token::RightBrace => {
+                return Ok(result.unwrap())
+            },
+            Token::If => {
+                let (node, next_token) = if_statement(is, &t)?;
+                next_node = Some(node);
                 t = next_token;
             },
             Token::EndOfStream => {
-                return Ok(result)
+                return Err(WutError::UnexpectedEndOfStream)
             },
             t => {
                 return Err(WutError::UnexpectedToken(t))
             }
         }
+
+        if let Some(next_node) = next_node {
+            if result.is_some() {
+                result = Some(AstNode::Glue(Box::new(result.unwrap()), Box::new(next_node)));
+            } else {
+                result = Some(next_node);
+            }
+        }
     }
+}
+
+fn has_comparison_operator(n: &AstNode) -> bool {
+    return if let AstNode::BinaryOp(op, _, _) = n {
+        return match op {
+            AstOp::Equals | AstOp::NotEquals | AstOp::LessThan |
+            AstOp::GreaterThan | AstOp::LessEqual | AstOp::GreaterEqual => { true },
+            _ => { false }
+        }
+    } else {
+        false
+    }
+}
+
+fn if_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
+    let t = match_token_and_scan(is, &t, "expected 'if'", |t| *t == Token::If)?;
+    let t = match_leftparen(is, &t)?;
+    let (condition_ast, t) = binexpr(is, &t, 0, 0)?;
+    let t = match_rightparen(is, &t)?;
+
+    if !has_comparison_operator(&condition_ast) {
+        return Err(WutError::Fatal("expected comparison operator".to_string()))
+    }
+
+    let true_branch = compound_statements(is, &t)?;
+    let mut false_branch: Option<Box<AstNode>> = None;
+    let mut t = scan(is)?;
+    if t == Token::Else {
+        t = scan(is)?;
+        let node = compound_statements(is, &t)?;
+        false_branch = Some(Box::new(node));
+        t = scan(is)?;
+    }
+    let node = AstNode::If(Box::new(condition_ast), Box::new(true_branch), false_branch);
+    Ok((node, t))
 }
 
 #[derive(Debug,PartialEq)]
@@ -198,6 +328,8 @@ enum WutError {
     UnexpectedToken(Token),
     UnexpectedChar(char),
     Mismatch(String),
+    UnexpectedEndOfStream,
+    Fatal(String),
 }
 
 fn token_to_astop(t: &Token) -> Result<AstOp, WutError> {
@@ -206,6 +338,12 @@ fn token_to_astop(t: &Token) -> Result<AstOp, WutError> {
         Token::Minus => { Ok(AstOp::Subtract) },
         Token::Star => { Ok(AstOp::Multiply) },
         Token::Slash => { Ok(AstOp::Divide) },
+        Token::Equals => { Ok(AstOp::Equals) },
+        Token::NotEquals => { Ok(AstOp::NotEquals) },
+        Token::LessThan => { Ok(AstOp::LessThan) },
+        Token::GreaterThan => { Ok(AstOp::GreaterThan) },
+        Token::LessEqual => { Ok(AstOp::LessEqual) },
+        Token::GreaterEqual => { Ok(AstOp::GreaterEqual) },
         _ => { Err(WutError::UnexpectedToken(t.clone())) },
     }
 }
@@ -232,6 +370,9 @@ fn binexpr(is: &mut dyn CharStream, token: &Token, prev_token_precedence: i32, l
     if let Token::Semicolon = current_token {
         return Ok((left, current_token))
     }
+    if let Token::RightParen = current_token {
+        return Ok((left, current_token))
+    }
 
     loop {
         let current_token_precedence = get_token_operator_precedence(&current_token)?;
@@ -246,6 +387,9 @@ fn binexpr(is: &mut dyn CharStream, token: &Token, prev_token_precedence: i32, l
         if let Token::Semicolon = current_token {
             break;
         }
+        if let Token::RightParen = current_token {
+            break;
+        }
     }
     Ok((left, current_token))
 }
@@ -255,7 +399,8 @@ fn main() -> Result<(), std::io::Error> {
     let mut is = FileStream::new(f);
     //let mut is = StringStream::new("2 *3 + 4*5");
 
-    let s = statements(&mut is).unwrap();
+    let t = scan(&mut is).unwrap();
+    let s = compound_statements(&mut is, &t).unwrap();
     println!("{:?}", s);
 
     Ok(())
@@ -283,9 +428,10 @@ mod tests {
         n.0
     }
 
-    fn invoke_statements(s: &str) -> Result<Vec<AstNode>, WutError> {
+    fn invoke_statements(s: &str) -> Result<AstNode, WutError> {
         let mut ss = StringStream::new(&s);
-        statements(&mut ss)
+        let t = scan(&mut ss).unwrap();
+        compound_statements(&mut ss, &t)
     }
 
     #[test]
@@ -365,27 +511,24 @@ mod tests {
 
     #[test]
     fn statement_declare_single_int() {
-        let s = invoke_statements("int i;").unwrap();
-        assert_eq!(1, s.len());
-        assert_eq!(AstNode::DeclareVariable("i".to_string()), *s.first().unwrap());
+        let s = invoke_statements("{int i;}").unwrap();
+        assert_eq!(AstNode::DeclareVariable("i".to_string()), s);
     }
 
     #[test]
     fn statement_assign_var_int() {
-        let s = invoke_statements("a=1;").unwrap();
-        assert_eq!(1, s.len());
+        let s = invoke_statements("{a=1;}").unwrap();
         assert_eq!(
             AstNode::BinaryOp(
                 AstOp::Assign,
                 Box::new(AstNode::IntegerLiteral(1)),
                 Box::new(AstNode::LValueIdentifier("a".to_string())),
-            ), *s.first().unwrap());
+            ), s);
     }
 
     #[test]
     fn statement_assign_var_expr() {
-        let s = invoke_statements("a=1+2;").unwrap();
-        assert_eq!(1, s.len());
+        let s = invoke_statements("{a=1+2;}").unwrap();
         assert_eq!(
             AstNode::BinaryOp(
                 AstOp::Assign,
@@ -397,6 +540,105 @@ mod tests {
                     )
                 ),
                 Box::new(AstNode::LValueIdentifier("a".to_string())),
-            ), *s.first().unwrap());
+            ), s);
+    }
+
+    #[test]
+    fn statement_assign_var_int_twice() {
+        let s = invoke_statements("{a=1;b=2;}").unwrap();
+        assert_eq!(
+            AstNode::Glue(
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Assign,
+                    Box::new(AstNode::IntegerLiteral(1)),
+                    Box::new(AstNode::LValueIdentifier("a".to_string())),
+                )),
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Assign,
+                    Box::new(AstNode::IntegerLiteral(2)),
+                    Box::new(AstNode::LValueIdentifier("b".to_string())),
+                ))
+            ), s);
+    }
+
+    #[test]
+    fn scan_assign() {
+        assert_eq!(Token::Assign, invoke_scan("=").unwrap());
+    }
+
+    #[test]
+    fn scan_braces() {
+        assert_eq!(Token::LeftBrace, invoke_scan("{").unwrap());
+        assert_eq!(Token::RightBrace, invoke_scan("}").unwrap());
+    }
+
+    #[test]
+    fn scan_parens() {
+        assert_eq!(Token::LeftParen, invoke_scan("(").unwrap());
+        assert_eq!(Token::RightParen, invoke_scan(")").unwrap());
+    }
+
+    #[test]
+    fn scan_operators() {
+        assert_eq!(Token::Equals, invoke_scan("==").unwrap());
+        assert_eq!(Token::NotEquals, invoke_scan("!=").unwrap());
+        assert_eq!(Token::LessThan, invoke_scan("<").unwrap());
+        assert_eq!(Token::LessEqual, invoke_scan("<=").unwrap());
+        assert_eq!(Token::GreaterThan, invoke_scan(">").unwrap());
+        assert_eq!(Token::GreaterEqual, invoke_scan(">=").unwrap());
+    }
+
+    #[test]
+    fn scan_if() {
+        let r = invoke_scan("if").unwrap();
+        assert_eq!(Token::If, r);
+    }
+
+    #[test]
+    fn scan_else() {
+        let r = invoke_scan("else").unwrap();
+        assert_eq!(Token::Else, r);
+    }
+
+    #[test]
+    fn statement_if_without_else() {
+        let s = invoke_statements("{if(a==1) { b=2; }}").unwrap();
+        assert_eq!(
+            AstNode::If(
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Equals,
+                    Box::new(AstNode::LValueIdentifier("a".to_string())),
+                    Box::new(AstNode::IntegerLiteral(1)),
+                )),
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Assign,
+                    Box::new(AstNode::IntegerLiteral(2)),
+                    Box::new(AstNode::LValueIdentifier("b".to_string())),
+                )),
+                None
+            ), s);
+    }
+
+    #[test]
+    fn statement_if_with_else() {
+        let s = invoke_statements("{if(a==1) { b=2; } else { c=3; }}").unwrap();
+        assert_eq!(
+            AstNode::If(
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Equals,
+                    Box::new(AstNode::LValueIdentifier("a".to_string())),
+                    Box::new(AstNode::IntegerLiteral(1)),
+                )),
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Assign,
+                    Box::new(AstNode::IntegerLiteral(2)),
+                    Box::new(AstNode::LValueIdentifier("b".to_string())),
+                )),
+                Some(Box::new(AstNode::BinaryOp(
+                    AstOp::Assign,
+                    Box::new(AstNode::IntegerLiteral(3)),
+                    Box::new(AstNode::LValueIdentifier("c".to_string())),
+                ))),
+            ), s);
     }
 }
