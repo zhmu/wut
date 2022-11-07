@@ -29,6 +29,7 @@ enum Token {
     Else,
     While,
     For,
+    Void,
 }
 
 #[derive(Debug,PartialEq)]
@@ -48,6 +49,7 @@ enum AstOp {
 
 #[derive(Debug,PartialEq)]
 enum AstNode {
+    Empty,
     Glue(Box<AstNode>, Box<AstNode>),
     BinaryOp(AstOp, Box<AstNode>, Box<AstNode>),
     If(Box<AstNode>, Box<AstNode>, Option<Box<AstNode>>),
@@ -55,6 +57,7 @@ enum AstNode {
     LValueIdentifier(String),
     DeclareVariable(String),
     While(Box<AstNode>, Box<AstNode>),
+    Function(String, Box<AstNode>),
 }
 
 fn get_token_operator_precedence(t: &Token) -> Result<i32, WutError> {
@@ -122,6 +125,8 @@ fn get_token_from_ident(ident: &str) -> Result<Token, WutError> {
         return Ok(Token::While)
     } else if ident == "for" {
         return Ok(Token::For)
+    } else if ident == "void" {
+        return Ok(Token::Void)
     }
     Ok(Token::Identifier(ident.to_string()))
 }
@@ -273,11 +278,11 @@ fn single_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Toke
     }
 }
 
-fn compound_statements(is: &mut dyn CharStream, t: &Token) -> Result<AstNode, WutError> {
+fn compound_statements(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
     let mut result: Option<AstNode> = None;
     let mut t = match_leftbrace(is, &t)?;
 
-    loop {
+    while Token::RightBrace != t {
         let (next_node, next_token) = single_statement(is, &t)?;
         t = next_token;
 
@@ -296,11 +301,14 @@ fn compound_statements(is: &mut dyn CharStream, t: &Token) -> Result<AstNode, Wu
         } else {
             result = Some(next_node);
         }
-
-        if Token::RightBrace == t {
-            return Ok(result.unwrap())
-        }
     }
+
+    if result.is_none() {
+        result = Some(AstNode::Empty);
+    }
+
+    let next_token = scan(is)?;
+    Ok((result.unwrap(), next_token))
 }
 
 fn has_comparison_operator(n: &AstNode) -> bool {
@@ -325,17 +333,16 @@ fn if_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), 
         return Err(WutError::Fatal("expected comparison operator".to_string()))
     }
 
-    let true_branch = compound_statements(is, &t)?;
+    let (true_branch, mut next_token) = compound_statements(is, &t)?;
     let mut false_branch: Option<Box<AstNode>> = None;
-    let mut t = scan(is)?;
-    if t == Token::Else {
-        t = scan(is)?;
-        let node = compound_statements(is, &t)?;
+    if next_token == Token::Else {
+        let t = scan(is)?;
+        let (node, t) = compound_statements(is, &t)?;
         false_branch = Some(Box::new(node));
-        t = scan(is)?;
+        next_token = t;
     }
     let node = AstNode::If(Box::new(condition_ast), Box::new(true_branch), false_branch);
-    Ok((node, t))
+    Ok((node, next_token))
 }
 
 fn while_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
@@ -348,10 +355,9 @@ fn while_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token
         return Err(WutError::Fatal("expected comparison operator".to_string()))
     }
 
-    let body = compound_statements(is, &t)?;
-    let t = scan(is)?;
+    let (body, next_token) = compound_statements(is, &t)?;
     let node = AstNode::While(Box::new(condition_ast), Box::new(body));
-    Ok((node, t))
+    Ok((node, next_token))
 }
 
 fn for_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
@@ -368,8 +374,7 @@ fn for_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token),
         return Err(WutError::Fatal("expected comparison operator".to_string()))
     }
 
-    let body_ast = compound_statements(is, &t)?;
-    let t = scan(is)?;
+    let (body_ast, next_token) = compound_statements(is, &t)?;
     let node = AstNode::Glue(
         Box::new(prepare_ast),
         Box::new(
@@ -382,7 +387,19 @@ fn for_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token),
             )
         )
     );
-    Ok((node, t))
+    Ok((node, next_token))
+}
+
+fn function_declaration(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
+    let t = match_token_and_scan(is, &t, "expected 'void'", |t| *t == Token::Void)?;
+    let (ident, t) = match_ident(is, &t)?;
+
+    let t = match_leftparen(is, &t)?;
+    let t = match_rightparen(is, &t)?;
+    let (body_ast, next_token) = compound_statements(is, &t)?;
+
+    let node = AstNode::Function(ident, Box::new(body_ast));
+    Ok((node, next_token))
 }
 
 #[derive(Debug,PartialEq)]
@@ -462,9 +479,14 @@ fn main() -> Result<(), std::io::Error> {
     let mut is = FileStream::new(f);
     //let mut is = StringStream::new("2 *3 + 4*5");
 
-    let t = scan(&mut is).unwrap();
-    let s = compound_statements(&mut is, &t).unwrap();
-    println!("{:?}", s);
+    let mut t = scan(&mut is).unwrap();
+    loop {
+        let (node, next_token) = function_declaration(&mut is, &t).unwrap();
+        println!("{:?}", node);
+
+        t = next_token;
+        if Token::EndOfStream == t { break; }
+    }
 
     Ok(())
 }
@@ -494,7 +516,9 @@ mod tests {
     fn invoke_statements(s: &str) -> Result<AstNode, WutError> {
         let mut ss = StringStream::new(&s);
         let t = scan(&mut ss).unwrap();
-        compound_statements(&mut ss, &t)
+        let (node, next_token) = compound_statements(&mut ss, &t).unwrap();
+        assert_eq!(Token::EndOfStream, next_token);
+        Ok(node)
     }
 
     #[test]
@@ -659,6 +683,12 @@ mod tests {
     }
 
     #[test]
+    fn empty_statement() {
+        let s = invoke_statements("{}").unwrap();
+        assert_eq!(AstNode::Empty, s);
+    }
+
+    #[test]
     fn statement_if_without_else() {
         let s = invoke_statements("{if(a==1) { b=2; }}").unwrap();
         assert_eq!(
@@ -760,5 +790,14 @@ mod tests {
                     ))
                 ))
             ), s);
+    }
+
+    #[test]
+    fn void_function() {
+        let mut ss = StringStream::new("void main() { }");
+        let t = scan(&mut ss).unwrap();
+        let (node, next_token) = function_declaration(&mut ss, &t).unwrap();
+        assert_eq!(Token::EndOfStream, next_token);
+        assert_eq!(AstNode::Function("main".to_string(), Box::new(AstNode::Empty)), node);
     }
 }
