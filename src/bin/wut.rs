@@ -27,6 +27,8 @@ enum Token {
     RightParen,
     If,
     Else,
+    While,
+    For,
 }
 
 #[derive(Debug,PartialEq)]
@@ -52,6 +54,7 @@ enum AstNode {
     IntegerLiteral(i32),
     LValueIdentifier(String),
     DeclareVariable(String),
+    While(Box<AstNode>, Box<AstNode>),
 }
 
 fn get_token_operator_precedence(t: &Token) -> Result<i32, WutError> {
@@ -111,12 +114,14 @@ fn scan_ident(is: &mut dyn CharStream) -> String {
 fn get_token_from_ident(ident: &str) -> Result<Token, WutError> {
     if ident == "int" {
         return Ok(Token::Int)
-    }
-    if ident == "if" {
+    } else if ident == "if" {
         return Ok(Token::If)
-    }
-    if ident == "else" {
+    } else if ident == "else" {
         return Ok(Token::Else)
+    } else if ident == "while" {
+        return Ok(Token::While)
+    } else if ident == "for" {
+        return Ok(Token::For)
     }
     Ok(Token::Identifier(ident.to_string()))
 }
@@ -225,7 +230,6 @@ fn match_rightparen(is: &mut dyn CharStream, t: &Token) -> Result<Token, WutErro
 fn var_declaration(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
     let ident = match_token_and_scan(is, t, "expected 'Int'", |t| *t == Token::Int)?;
     let (ident, t) = match_ident(is, &ident)?;
-    let t = match_semicolon(is, &t)?;
 
     let node = AstNode::DeclareVariable(ident);
     Ok((node, t))
@@ -236,7 +240,6 @@ fn assignment(is: &mut dyn CharStream, ident: &Token) -> Result<(AstNode, Token)
 
     let t = match_token_and_scan(is, &t, "expected '='", |t| *t == Token::Assign)?;
     let (left, t) = binexpr(is, &t, 0, 0)?;
-    let t = match_semicolon(is, &t)?;
 
     let right = AstNode::LValueIdentifier(ident.to_string());
 
@@ -244,45 +247,58 @@ fn assignment(is: &mut dyn CharStream, ident: &Token) -> Result<(AstNode, Token)
     Ok((node, t))
 }
 
+fn single_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
+    return match t {
+        Token::Int => {
+            var_declaration(is, &t)
+        },
+        Token::Identifier(_) => {
+            assignment(is, &t)
+        },
+        Token::If => {
+            if_statement(is, &t)
+        },
+        Token::While => {
+            while_statement(is, &t)
+        },
+        Token::For => {
+            for_statement(is, &t)
+        },
+        Token::EndOfStream => {
+            return Err(WutError::UnexpectedEndOfStream)
+        },
+        t => {
+            return Err(WutError::UnexpectedToken(t.clone()))
+        }
+    }
+}
+
 fn compound_statements(is: &mut dyn CharStream, t: &Token) -> Result<AstNode, WutError> {
     let mut result: Option<AstNode> = None;
     let mut t = match_leftbrace(is, &t)?;
 
     loop {
-        let next_node: Option<AstNode>;
-        match t {
-            Token::Int => {
-                let (node, next_token) = var_declaration(is, &t)?;
-                next_node = Some(node);
-                t = next_token;
-            },
-            Token::Identifier(_) => {
-                let (node, next_token) = assignment(is, &t)?;
-                next_node = Some(node);
-                t = next_token;
-            },
-            Token::RightBrace => {
-                return Ok(result.unwrap())
-            },
-            Token::If => {
-                let (node, next_token) = if_statement(is, &t)?;
-                next_node = Some(node);
-                t = next_token;
-            },
-            Token::EndOfStream => {
-                return Err(WutError::UnexpectedEndOfStream)
-            },
-            t => {
-                return Err(WutError::UnexpectedToken(t))
+        let (next_node, next_token) = single_statement(is, &t)?;
+        t = next_token;
+
+        // XXX This is a bit crude: we need semicolons after assignments and
+        // variable declarations (there ought to be a better way to do this)
+        if let AstNode::BinaryOp(op, _, _) = &next_node {
+            if *op == AstOp::Assign {
+                t = match_semicolon(is, &t)?;
             }
+        } else if let AstNode::DeclareVariable(_) = &next_node {
+            t = match_semicolon(is, &t)?;
         }
 
-        if let Some(next_node) = next_node {
-            if result.is_some() {
-                result = Some(AstNode::Glue(Box::new(result.unwrap()), Box::new(next_node)));
-            } else {
-                result = Some(next_node);
-            }
+        if result.is_some() {
+            result = Some(AstNode::Glue(Box::new(result.unwrap()), Box::new(next_node)));
+        } else {
+            result = Some(next_node);
+        }
+
+        if Token::RightBrace == t {
+            return Ok(result.unwrap())
         }
     }
 }
@@ -319,6 +335,53 @@ fn if_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), 
         t = scan(is)?;
     }
     let node = AstNode::If(Box::new(condition_ast), Box::new(true_branch), false_branch);
+    Ok((node, t))
+}
+
+fn while_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
+    let t = match_token_and_scan(is, &t, "expected 'while'", |t| *t == Token::While)?;
+    let t = match_leftparen(is, &t)?;
+    let (condition_ast, t) = binexpr(is, &t, 0, 0)?;
+    let t = match_rightparen(is, &t)?;
+
+    if !has_comparison_operator(&condition_ast) {
+        return Err(WutError::Fatal("expected comparison operator".to_string()))
+    }
+
+    let body = compound_statements(is, &t)?;
+    let t = scan(is)?;
+    let node = AstNode::While(Box::new(condition_ast), Box::new(body));
+    Ok((node, t))
+}
+
+fn for_statement(is: &mut dyn CharStream, t: &Token) -> Result<(AstNode, Token), WutError> {
+    let t = match_token_and_scan(is, &t, "expected 'for'", |t| *t == Token::For)?;
+    let t = match_leftparen(is, &t)?;
+    let (prepare_ast, t) = single_statement(is, &t)?;
+    let t = match_semicolon(is, &t)?;
+    let (condition_ast, t) = binexpr(is, &t, 0, 0)?;
+    let t = match_semicolon(is, &t)?;
+    let (iteration_ast, t) = single_statement(is, &t)?;
+    let t = match_rightparen(is, &t)?;
+
+    if !has_comparison_operator(&condition_ast) {
+        return Err(WutError::Fatal("expected comparison operator".to_string()))
+    }
+
+    let body_ast = compound_statements(is, &t)?;
+    let t = scan(is)?;
+    let node = AstNode::Glue(
+        Box::new(prepare_ast),
+        Box::new(
+            AstNode::While(
+                Box::new(condition_ast),
+                Box::new(AstNode::Glue(
+                    Box::new(body_ast),
+                    Box::new(iteration_ast),
+                ))
+            )
+        )
+    );
     Ok((node, t))
 }
 
@@ -589,15 +652,10 @@ mod tests {
     }
 
     #[test]
-    fn scan_if() {
-        let r = invoke_scan("if").unwrap();
-        assert_eq!(Token::If, r);
-    }
-
-    #[test]
-    fn scan_else() {
-        let r = invoke_scan("else").unwrap();
-        assert_eq!(Token::Else, r);
+    fn scan_identifiers() {
+        assert_eq!(Token::If, invoke_scan("if").unwrap());
+        assert_eq!(Token::Else, invoke_scan("else").unwrap());
+        assert_eq!(Token::While, invoke_scan("while").unwrap());
     }
 
     #[test]
@@ -639,6 +697,68 @@ mod tests {
                     Box::new(AstNode::IntegerLiteral(3)),
                     Box::new(AstNode::LValueIdentifier("c".to_string())),
                 ))),
+            ), s);
+    }
+
+    #[test]
+    fn statement_while() {
+        let s = invoke_statements("{while(a < 10) { a = a + 1; }}").unwrap();
+        assert_eq!(
+            AstNode::While(
+                Box::new(AstNode::BinaryOp(
+                    AstOp::LessThan,
+                    Box::new(AstNode::LValueIdentifier("a".to_string())),
+                    Box::new(AstNode::IntegerLiteral(10)),
+                )),
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Assign,
+                    Box::new(AstNode::BinaryOp(
+                        AstOp::Add,
+                        Box::new(AstNode::LValueIdentifier("a".to_string())),
+                        Box::new(AstNode::IntegerLiteral(1)),
+                    )),
+                    Box::new(AstNode::LValueIdentifier("a".to_string())),
+                ))
+            ), s);
+    }
+
+    #[test]
+    fn statement_for() {
+        let s = invoke_statements("{for(a=0; a < 5; a = a + 1) { b = b + 1; }}").unwrap();
+        assert_eq!(
+            AstNode::Glue(
+                Box::new(AstNode::BinaryOp(
+                    AstOp::Assign,
+                    Box::new(AstNode::IntegerLiteral(0)),
+                    Box::new(AstNode::LValueIdentifier("a".to_string())),
+                )),
+                Box::new(AstNode::While(
+                    Box::new(AstNode::BinaryOp(
+                        AstOp::LessThan,
+                        Box::new(AstNode::LValueIdentifier("a".to_string())),
+                        Box::new(AstNode::IntegerLiteral(5)),
+                    )),
+                    Box::new(AstNode::Glue(
+                        Box::new(AstNode::BinaryOp(
+                            AstOp::Assign,
+                            Box::new(AstNode::BinaryOp(
+                                AstOp::Add,
+                                Box::new(AstNode::LValueIdentifier("b".to_string())),
+                                Box::new(AstNode::IntegerLiteral(1)),
+                            )),
+                            Box::new(AstNode::LValueIdentifier("b".to_string())),
+                        )),
+                        Box::new(AstNode::BinaryOp(
+                            AstOp::Assign,
+                            Box::new(AstNode::BinaryOp(
+                                AstOp::Add,
+                                Box::new(AstNode::LValueIdentifier("a".to_string())),
+                                Box::new(AstNode::IntegerLiteral(1)),
+                            )),
+                            Box::new(AstNode::LValueIdentifier("a".to_string())),
+                        )),
+                    ))
+                ))
             ), s);
     }
 }
